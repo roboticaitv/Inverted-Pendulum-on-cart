@@ -94,7 +94,7 @@ void PhysicsTask(void *pvParameters) {
       float debug_term_integral = 0.0f;
       
       // --- A. LIMIT SWITCH E-STOP ---
-      if (sysState.flagA || fabsf(unitM.linear_position_m) >= Config::StateMachine::RailLimitM) {
+      if (sysState.flagA) {
         unitM.accumulated_ticks = 0;
         prev_ticks = 0;
         unitM.linear_position_m = 0.0f;
@@ -251,21 +251,53 @@ void PhysicsTask(void *pvParameters) {
 
           // 2. STATE EXECUTION
           if (sysState.pen_state == STATE_SWINGUP) {
+            static enum { SWING_LOW, SWING_HIGH, SWING_UNCERTAIN } swingState = SWING_UNCERTAIN;
+            static float currentSwingPeak = 0.0f;
+            static float lastPeakAngle = 0.0f;
+            
             if (sysState.auto_swingup_enabled) {
-              if (fabsf(theta) < M_PI_2) {
-                // In the top half, just coast! Any acceleration here risks throwing the stick the wrong way.
-                debug_control = 0.0f;
-              } else {
-                // Proportional Pumping: Max acceleration at the bottom, tapers to zero at the peaks.
-                float pump = Config::LQR::PumpK * w * cosf(theta);
-                
-                // Gentle drift correction has time to work when the pump tapers off at the peaks
-                float center_pull = 150.0f * x; 
-                debug_control = pump + center_pull;
+              // 1. Zero Crossing Detection
+              if (fabsf(clean_arm1) > currentSwingPeak) currentSwingPeak = fabsf(clean_arm1);
+
+              bool crossed = false;
+              if (swingState != SWING_HIGH && clean_arm1 > 5.0f) {
+                  swingState = SWING_HIGH;
+                  crossed = true;
+              } else if (swingState != SWING_LOW && clean_arm1 < -5.0f) {
+                  swingState = SWING_LOW;
+                  crossed = true;
               }
+
+              if (crossed) {
+                  lastPeakAngle = currentSwingPeak;
+                  currentSwingPeak = 0.0f;
+              }
+
+              // 2. Phase-Lead Pump Logic
+              float lookAhead = clean_arm1 + (filtered_arm1_vel * 0.15f);
+              float pump_scale = 1.0f;
+              
+              // Smoothly ramp down the pump strength as we approach the top
+              if (lastPeakAngle > 120.0f) {
+                  pump_scale = (175.0f - lastPeakAngle) / 55.0f;
+                  pump_scale = constrain(pump_scale, 0.0f, 1.0f);
+              }
+
+              float pump = 0.0f;
+              if (lookAhead > 0) {
+                  pump = Config::LQR::PumpK * pump_scale; // Push Left -> Stick whips Right
+              } else {
+                  pump = -Config::LQR::PumpK * pump_scale; // Push Right -> Stick whips Left
+              }
+
+              // 3. E-Stop & Rail Safety (RailLimitM is 0.40)
+              if (x > 0.30f && pump < 0.0f) pump = 0.0f; 
+              if (x < -0.30f && pump > 0.0f) pump = 0.0f;
+
+              // 4. Soft centering
+              debug_control = pump + (20.0f * x); 
             } else {
-              // Manual resting state - just hold center with damping
-              debug_control = 200.0f * x + 150.0f * v;
+              debug_control = 20.0f * x;
             }
 
             // Normal Stiction for Swingup
@@ -274,7 +306,7 @@ void PhysicsTask(void *pvParameters) {
               if (debug_control > 5.0f) stiction_sign = 1.0f;
               else if (debug_control < -5.0f) stiction_sign = -1.0f;
             } else {
-              stiction_sign = (v > 0.0f) ? -1.0f : 1.0f;
+              stiction_sign = (v > 0.0f) ? 1.0f : -1.0f;
             }
 
             pwm_output = debug_control + (Config::MotorModel::A_ff * v) + (Config::MotorModel::C_ff * stiction_sign);

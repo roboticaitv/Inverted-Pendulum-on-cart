@@ -1,24 +1,114 @@
 # Inverted Double Pendulum - Project Documentation
 
+## Table of Contents
+- [Introduction](#introduction)
+- [Theory of Operation](#theory-of-operation)
+  - [Cart-Pole State Space & LQR Control](#cart-pole-state-space--lqr-control)
+  - [Phase-Lead Swing-Up Algorithm](#phase-lead-swing-up-algorithm)
+- [Problem Description](#problem-description)
+- [Software Architecture](#software-architecture)
+- [Pinout Tables](#pinout-tables)
+- [Timing Diagrams & FreeRTOS Architecture](#timing-diagrams--freertos-architecture)
+- [State Machines](#state-machines)
+- [Serial Command Reference](#serial-command-reference)
+- [Python API Interfacing Guide](#python-api-interfacing-guide)
+
 ## Introduction
 
 The Inverted Double Pendulum is a classic, highly non-linear control systems problem that serves as an excellent testbed for advanced modern control theory, embedded real-time processing, and precision mechatronics. This project implements a motorized cart running on a linear rail to dynamically balance a pendulum in its upright, inverted position. 
 
 At its core, this project demonstrates the capability of an ESP32 microcontroller to handle hard real-time physics calculations using FreeRTOS, high-frequency sensor fusion, and multi-threaded processing. The system leverages state-feedback control (LQR) and an Integrator to maintain balance, while using a non-linear energy-pumping algorithm to "swing up" the pendulum from its resting downward state into the catch boundary.
 
+---
+
 ## Theory of Operation
+
+### Cart-Pole State Space & LQR Control
 
 The system functions essentially like balancing a broomstick on the palm of your hand, where the motorized cart acts as your hand and the pendulum as the broom. The core goal is to stabilize an extremely unstable equilibrium point.
 
-To achieve this, the ESP32 tracks four dynamic **State Variables**:
-- **Cart Position ($x$)**: The absolute position of the cart on the linear rail.
-- **Cart Velocity ($v$)**: The speed of the cart.
-- **Pendulum Angle ($\theta$)**: The deviation of the pendulum from vertical center.
-- **Pendulum Angular Velocity ($\omega$)**: The speed at which the pendulum is falling.
+To control the system, we first define its mathematical state. The dynamics of the cart-pole can be fully described by four dynamic **State Variables** at any given time:
 
-When the pendulum is near vertical, the system utilizes a **Linear Quadratic Regulator (LQR)**. The LQR algorithm multiplies each of these four state variables by specific gains (`Kth`, `Kw`, `Kx`, `Kv`) and sums them to determine the exact motor voltage (PWM) needed to counter the fall.
+1. **Cart Position ($x$)**: The absolute position of the cart on the linear rail (meters).
+2. **Cart Velocity ($v$)**: The speed of the cart (m/s).
+3. **Pendulum Angle ($\theta$)**: The deviation of the pendulum from vertical center (radians).
+4. **Pendulum Angular Velocity ($\omega$)**: The speed at which the pendulum is falling (rad/s).
 
-However, LQR is only effective near the equilibrium point. If the pendulum is resting straight down, the system enters a **Swing-Up Phase** where it pumps kinetic energy into the pendulum by jerking the cart back and forth until the pendulum swings high enough into the "Catch Zone" (e.g., within 15° of vertical). At that split second, the LQR balancer takes over to catch and stabilize it.
+We define the state vector $X$:
+
+$$
+X = \begin{bmatrix} x \\ v \\ \theta \\ \omega \end{bmatrix}
+$$
+
+Near the upright equilibrium point ($\theta \approx 0$), the highly non-linear equations of motion can be linearized into a standard state-space form:
+
+$$
+\dot{X} = A X + B u
+$$
+
+Where $A$ is the system dynamics matrix, $B$ is the input matrix, and $u$ is our control input (motor PWM).
+
+**Linear Quadratic Regulator (LQR)**
+
+The Linear Quadratic Regulator is an optimal control strategy. It calculates the optimal control input $u$ that minimizes a quadratic cost function $J$:
+
+$$
+J = \int_{0}^{\infty} (X^T Q X + u^T R u) dt
+$$
+
+- **$Q$ matrix**: Penalizes state errors (e.g., if we want to heavily penalize the pendulum angle falling, we increase the weight inside $Q$ for the $\theta$ state).
+- **$R$ matrix**: Penalizes control effort (e.g., if we want to save power or prevent the motors from saturating, we increase the penalty in $R$).
+
+By solving the Algebraic Riccati Equation offline, LQR provides an optimal feedback gain matrix $K = [K_x, K_v, K_\theta, K_\omega]$. In the embedded system, the control law becomes a simple weighted sum. When the pendulum is near vertical, the LQR algorithm multiplies each of these four state variables by specific gains (`Kth`, `Kw`, `Kx`, `Kv`) and sums them to determine the exact motor voltage (PWM) needed to counter the fall:
+
+$$
+u = -K X = -(K_x x + K_v v + K_\theta \theta + K_\omega \omega)
+$$
+
+**Adding an Integrator**
+
+A pure LQR controller can suffer from steady-state error (e.g., drift) due to friction, unmodeled dynamics, or an unlevel rail. To fix this, an Integrator state is added to the system, accumulating position error over time to force the cart exactly back to the center of the rail.
+
+**Implementation in the ESP32 Codebase**
+
+In the ESP32 firmware, the physical state variables are continuously updated using the motor encoders and the SPI magnetic angle sensor. During the `STATE_BALANCE` mode, the LQR algorithm is applied directly. Here is the exact code snippet demonstrating the LQR feedback loop and the integrator:
+
+```cpp
+else if (sysState.pen_state == STATE_BALANCE) {
+  // THE INTEGRATOR: Accumulate cart position error over time
+  x_integral += (x * Config::Hardware::DT);
+  x_integral = constrain(x_integral, -Config::LQR::IntLimit, Config::LQR::IntLimit);
+
+  // 1. Calculate individual LQR feedback terms (u = -KX)
+  debug_term_theta = Config::LQR::Kth * theta;
+  debug_term_w = Config::LQR::Kw * w;
+  
+  // To move the cart towards the center, we must first lean the stick towards the center.
+  // To lean the stick towards the center, we must accelerate the cart AWAY from the center.
+  // Therefore, Kx, Kv, and IntK must have the OPPOSITE sign of Kth and Kw!
+  debug_term_x = -Config::LQR::Kx * x;
+  debug_term_v = -Config::LQR::Kv * v;
+  debug_term_integral = -Config::LQR::IntK * x_integral;
+
+  // 2. Sum for total control output
+  debug_control = debug_term_theta 
+                  + debug_term_w 
+                  + debug_term_x 
+                  + debug_term_v
+                  + debug_term_integral;
+```
+
+### Phase-Lead Swing-Up Algorithm
+
+LQR is only effective near the equilibrium point. If the pendulum is resting straight down, the system enters a **Swing-Up Phase** utilizing an advanced **Phase-Lead Energy Pump Algorithm**:
+
+- **Zero-Crossing Detection**: The system tracks the maximum peak angle of each consecutive swing.
+- **Phase-Lead Pumping**: By projecting the angle slightly into the future using its angular velocity, the cart reverses direction just *before* the pendulum crosses the center. This maximizes kinetic energy transfer.
+- **Proportional Ramp-Down**: As the peak swing approaches the top (e.g., past 120°), the pump strength is linearly scaled down. This prevents the pendulum from violently overshooting the Catch Zone.
+
+Once the pendulum enters the "Catch Zone" (e.g., within 15° of vertical), the LQR balancer seamlessly takes over to catch and stabilize it.
+
+---
 
 ## Problem Description
 
@@ -34,6 +124,8 @@ Key engineering challenges solved within this codebase include:
 - **Real-Time Constraints**: Executing a deterministic 1000 Hz control loop and 4000 Hz sensor read loop using FreeRTOS pinned tasks.
 - **Hardware Imperfections**: Overcoming static motor friction (stiction), compensating for back-EMF, and smoothing sensor noise using wrap-safe finite difference derivatives.
 - **Safety Constraints**: Implementing soft rail limits (e.g., stopping the cart if it travels beyond $\pm0.4$m) and hardware limit switch homing.
+
+---
 
 ## Software Architecture
 
